@@ -164,6 +164,22 @@ export class WeixinAdapter extends CodeAdapter {
         content = this.processContent(content)
       }
 
+      // 处理封面图
+      let coverCdnUrl = ''
+      let coverFileId = ''
+
+      if (article.cover) {
+        try {
+          logger.info('Uploading cover image for WeChat...')
+          const coverRes = await this.uploadImageByUrl(article.cover)
+          coverCdnUrl = coverRes.url
+          coverFileId = coverRes.attrs?.fileid ? String(coverRes.attrs.fileid) : ''
+          logger.info('WeChat cover uploaded successfully:', { coverCdnUrl, coverFileId })
+        } catch (error) {
+          logger.warn('Failed to upload WeChat cover image:', error)
+        }
+      }
+
       const formData = new URLSearchParams({
         token: this.weixinMeta!.token,
         lang: 'zh_CN',
@@ -182,17 +198,17 @@ export class WeixinAdapter extends CodeAdapter {
         title0: article.title,
         author0: '',
         writerid0: '0',
-        fileid0: '',
+        fileid0: coverFileId || '',
         digest0: '',
         auto_gen_digest0: '1',
         content0: content,
         sourceurl0: '',
         need_open_comment0: '1',
         only_fans_can_comment0: '0',
-        cdn_url0: '',
-        cdn_235_1_url0: '',
-        cdn_1_1_url0: '',
-        cdn_url_back0: '',
+        cdn_url0: coverCdnUrl || '',
+        cdn_235_1_url0: coverCdnUrl || '',
+        cdn_1_1_url0: coverCdnUrl || '',
+        cdn_url_back0: coverCdnUrl || '',
         crop_list0: '',
         music_id0: '',
         video_id0: '',
@@ -268,27 +284,27 @@ export class WeixinAdapter extends CodeAdapter {
     }))
   }
 
-  protected async uploadImageByUrl(src: string): Promise<ImageUploadResult> {
+  /**
+   * 上传 Blob 图片到微信公众号素材库
+   */
+  async uploadBlob(blob: Blob, filename?: string): Promise<{ url: string; fileId?: string }> {
     if (!this.weixinMeta) {
-      throw new Error('未登录')
+      const auth = await this.checkAuth()
+      if (!auth.isAuthenticated || !this.weixinMeta) {
+        throw new Error('请先登录微信公众号')
+      }
     }
-
-    const imageResponse = await fetch(src)
-    if (!imageResponse.ok) {
-      throw new Error('图片下载失败: ' + src)
-    }
-    const imageBlob = await imageResponse.blob()
 
     const formData = new FormData()
     const timestamp = Date.now()
-    const fileName = `${timestamp}.jpg`
+    const fileName = filename || `${timestamp}.jpg`
 
-    formData.append('type', imageBlob.type || 'image/jpeg')
+    formData.append('type', blob.type || 'image/jpeg')
     formData.append('id', String(timestamp))
     formData.append('name', fileName)
     formData.append('lastModifiedDate', new Date().toString())
-    formData.append('size', String(imageBlob.size))
-    formData.append('file', imageBlob, fileName)
+    formData.append('size', String(blob.size))
+    formData.append('file', blob, fileName)
 
     const { token, userName, ticket, svrTime } = this.weixinMeta
     const seq = Date.now()
@@ -305,17 +321,60 @@ export class WeixinAdapter extends CodeAdapter {
     const res = await response.json() as {
       cdn_url?: string
       content?: string
+      file_id?: number | string
+      media_id?: number | string
       base_resp?: { err_msg: string; ret: number }
     }
 
     logger.debug(' Image upload response:', res)
 
     if (res.base_resp?.err_msg !== 'ok' || !res.cdn_url) {
-      throw new Error('图片上传失败: ' + src)
+      throw new Error('微信图片上传失败: ' + (res.base_resp?.err_msg || '未知错误'))
     }
 
+    const fileId = String(res.content || res.file_id || res.media_id || '')
     return {
       url: res.cdn_url,
+      fileId,
+    }
+  }
+
+  /**
+   * 实现 PlatformAdapter.uploadImage 接口（供 CLI/Bridge 调用）
+   */
+  async uploadImage(file: Blob, filename?: string): Promise<string> {
+    const res = await this.uploadBlob(file, filename)
+    return res.url
+  }
+
+  /**
+   * 根据 URL 或 data URI 上传图片
+   */
+  protected async uploadImageByUrl(src: string): Promise<ImageUploadResult> {
+    let blob: Blob
+
+    if (src.startsWith('data:')) {
+      const match = src.match(/^data:([^;]+);base64,(.+)$/)
+      if (!match) throw new Error('Invalid data URI')
+      const mimeType = match[1]
+      const binary = atob(match[2])
+      const bytes = new Uint8Array(binary.length)
+      for (let i = 0; i < binary.length; i++) {
+        bytes[i] = binary.charCodeAt(i)
+      }
+      blob = new Blob([bytes], { type: mimeType })
+    } else {
+      const imageResponse = await fetch(src)
+      if (!imageResponse.ok) {
+        throw new Error('图片下载失败: ' + src)
+      }
+      blob = await imageResponse.blob()
+    }
+
+    const res = await this.uploadBlob(blob)
+    return {
+      url: res.url,
+      attrs: res.fileId ? { fileid: res.fileId } : undefined,
     }
   }
 
