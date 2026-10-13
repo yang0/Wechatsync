@@ -17,6 +17,7 @@ import path from 'path'
 import juice from 'juice'
 import { ExtensionBridge } from '@wechatsync/mcp-server/bridge'
 import type { PlatformInfo, SyncResult } from '@wechatsync/mcp-server/bridge'
+import { convertTablesToImages } from './table-image'
 
 const WS_PORT = parseInt(process.env.SYNC_WS_PORT || '9527', 10)
 
@@ -301,7 +302,7 @@ function parseFileContent(filePath: string): ParsedContent {
   const ext = path.extname(filePath).toLowerCase()
 
   if (ext === '.md' || ext === '.markdown') {
-    return parseMarkdown(content)
+    return parseMarkdown(content, filePath)
   } else if (ext === '.html' || ext === '.htm') {
     return parseHtml(content, filePath)
   } else {
@@ -317,8 +318,10 @@ function parseFileContent(filePath: string): ParsedContent {
 /**
  * 解析 Markdown 文件
  */
-function parseMarkdown(content: string): ParsedContent {
+function parseMarkdown(content: string, filePath?: string): ParsedContent {
   let title: string | null = null
+  let cover: string | undefined
+  let summary: string | undefined
   let body = content
 
   // 1. 尝试从 YAML front matter 提取
@@ -328,6 +331,14 @@ function parseMarkdown(content: string): ParsedContent {
     const titleMatch = frontMatter.match(/^title:\s*["']?(.+?)["']?\s*$/m)
     if (titleMatch) {
       title = titleMatch[1].trim()
+    }
+    const coverMatch = frontMatter.match(/^(?:cover|image|banner):\s*["']?(.+?)["']?\s*$/m)
+    if (coverMatch) {
+      cover = coverMatch[1].trim()
+    }
+    const summaryMatch = frontMatter.match(/^(?:summary|description):\s*["']?(.+?)["']?\s*$/m)
+    if (summaryMatch) {
+      summary = summaryMatch[1].trim()
     }
     // 移除 front matter
     body = content.slice(yamlMatch[0].length)
@@ -343,10 +354,47 @@ function parseMarkdown(content: string): ParsedContent {
     }
   }
 
-  // 3. 清理内容
+  // 3. 智能检测封面图（如果 front matter 未指定封面）
+  if (!cover && filePath) {
+    const fileDir = path.dirname(filePath)
+    // 优先从 Markdown 中的图片寻找包含 cover 或 封面的图片，或者使用第一张图片
+    const mdImages = findLocalImages(body, fileDir)
+    if (mdImages.length > 0) {
+      const explicitCover = mdImages.find(
+        (img) => /cover|封面|banner/i.test(img.originalRef) || /cover|封面|banner/i.test(img.localPath)
+      )
+      if (explicitCover) {
+        cover = explicitCover.absolutePath
+      } else {
+        // 第一张图片作为默认候选封面
+        cover = mdImages[0].absolutePath
+      }
+    } else {
+      // 检查目录下是否存在命名为 cover.* 或 封面.* 的文件
+      const baseName = path.basename(filePath, path.extname(filePath))
+      const searchCandidates = [
+        path.join(fileDir, 'cover.png'),
+        path.join(fileDir, 'cover.jpg'),
+        path.join(fileDir, 'cover.jpeg'),
+        path.join(fileDir, 'images', baseName, 'cover_v2_5x2.png'),
+        path.join(fileDir, 'images', baseName, 'cover.png'),
+        path.join(fileDir, 'images', baseName, 'cover.jpg'),
+        path.join(fileDir, 'images', 'cover.png'),
+        path.join(fileDir, 'images', 'cover.jpg'),
+      ]
+      for (const candidate of searchCandidates) {
+        if (fs.existsSync(candidate)) {
+          cover = candidate
+          break
+        }
+      }
+    }
+  }
+
+  // 4. 清理内容
   body = body.trim()
 
-  // 4. 如果内容为空，返回原始内容
+  // 5. 如果内容为空，返回原始内容
   if (!body) {
     body = content
   }
@@ -355,6 +403,8 @@ function parseMarkdown(content: string): ParsedContent {
     title,
     content: body,
     format: 'markdown',
+    cover,
+    summary,
   }
 }
 
@@ -632,6 +682,9 @@ program
   .option('-p, --platforms <platforms>', '目标平台，逗号分隔', 'zhihu,juejin')
   .option('-t, --title <title>', '文章标题（默认从文件提取）')
   .option('--cover <url>', '封面图 URL 或本地路径')
+  .option('--table-as-image', '将 Markdown 表格自动渲染为高清卡片图片（默认对 X 平台启用）')
+  .option('--no-table-as-image', '禁用表格自动转图片')
+  .option('--save-table-images', '将渲染出的表格图片和替换后的引用写回 Markdown 源文件')
   .option('--dry-run', '仅显示将要执行的操作，不实际同步')
   .action(async (file: string, options) => {
     // 检查文件是否存在
@@ -652,11 +705,11 @@ program
       process.exit(1)
     }
 
-    // 处理封面图（优先使用命令行参数，回退到 HTML meta）
+    // 处理封面图（优先使用命令行参数，回退到 HTML meta / Markdown 提取）
     let cover = options.cover || parsed.cover
     if (cover && !cover.startsWith('http') && !cover.startsWith('data:')) {
-      // 本地文件，转为 base64
-      const coverPath = path.resolve(cover)
+      // 本地文件，转为 base64（支持相对路径）
+      const coverPath = path.isAbsolute(cover) ? cover : path.resolve(path.dirname(filePath), cover)
       if (fs.existsSync(coverPath)) {
         const coverBuffer = fs.readFileSync(coverPath)
         const ext = path.extname(coverPath).toLowerCase()
@@ -675,7 +728,33 @@ program
       }
     }
 
-    const platforms = options.platforms.split(',').map((p: string) => p.trim().toLowerCase())
+    const rawPlatforms = Array.isArray(options.platforms) ? options.platforms.join(',') : String(options.platforms || '')
+    const platforms = rawPlatforms
+      .split(/[,，\s]+/)
+      .map((p: string) => p.trim().toLowerCase())
+      .filter(Boolean)
+
+    // 处理 Markdown 表格转图片：
+    // 当显式开启 --table-as-image，或同步目标包含 x，且未显式指定 --no-table-as-image
+    const shouldConvertTables =
+      options.tableAsImage !== false &&
+      (options.tableAsImage === true || platforms.includes('x'))
+
+    if (parsed.format === 'markdown' && shouldConvertTables) {
+      try {
+        const tableResult = await convertTablesToImages(parsed.content, filePath)
+        if (tableResult.renderedCount > 0) {
+          console.log(chalk.green(`  ✓ 已自动将 ${tableResult.renderedCount} 个 Markdown 表格渲染为高清卡片图片`))
+          parsed.content = tableResult.content
+          if (options.saveTableImages) {
+            fs.writeFileSync(filePath, parsed.content, 'utf8')
+            console.log(chalk.gray(`  (已更新源文件: ${path.basename(filePath)})`))
+          }
+        }
+      } catch (tableErr) {
+        console.log(chalk.yellow(`  ⚠ 表格渲染图片跳过: ${(tableErr as Error).message}`))
+      }
+    }
 
     // 准备内容
     const markdown = parsed.format === 'markdown' ? parsed.content : undefined
@@ -706,7 +785,7 @@ program
       process.exit(1)
     }
 
-    // 处理本地图片：上传到第一个目标平台作为图床
+    // 处理本地图片：选择合适的目标平台作为图床
     const fileDir = path.dirname(filePath)
     const localImages = findLocalImages(parsed.content, fileDir)
 
@@ -714,8 +793,9 @@ program
     let processedHtml = html
 
     if (localImages.length > 0) {
-      // 使用第一个目标平台作为图床
-      const imageHost = platforms[0]
+      // 优先从目标平台中挑选适合做图床的平台
+      const preferredHosts = ['weixin', 'zhihu', 'weibo', 'juejin', 'csdn']
+      const imageHost = preferredHosts.find((p) => platforms.includes(p)) || platforms[0]
       console.log(chalk.bold(`发现 ${localImages.length} 张本地图片，上传到 ${imageHost}...`))
       console.log()
 
@@ -962,6 +1042,42 @@ program
     } finally {
       bridge.stop()
       process.exit(0)
+    }
+  })
+
+// ============ table-image 命令 ============
+
+program
+  .command('table-image <file>')
+  .description('将 Markdown 文件中的表格提取并渲染为高清卡片图片')
+  .option('-w, --write', '同时更新 Markdown 源文件，将表格替换为图片引用')
+  .action(async (file: string, options) => {
+    const filePath = path.resolve(file)
+    if (!fs.existsSync(filePath)) {
+      console.error(chalk.red(`文件不存在: ${filePath}`))
+      process.exit(1)
+    }
+
+    const content = fs.readFileSync(filePath, 'utf-8')
+    const spinner = ora('正在渲染表格图片...').start()
+    try {
+      const result = await convertTablesToImages(content, filePath)
+      if (result.renderedCount === 0) {
+        spinner.info('文件中未检测到 Markdown 表格')
+        return
+      }
+
+      spinner.succeed(`成功渲染 ${result.renderedCount} 个表格图片`)
+      if (options.write) {
+        fs.writeFileSync(filePath, result.content, 'utf-8')
+        console.log(chalk.green(`✓ 已将图片引用写回文件: ${path.basename(filePath)}`))
+      } else {
+        console.log(chalk.gray('提示: 加上 --write 参数可直接更新 Markdown 源文件'))
+      }
+    } catch (err) {
+      spinner.fail('表格渲染失败')
+      console.error(chalk.red((err as Error).message))
+      process.exit(1)
     }
   })
 
