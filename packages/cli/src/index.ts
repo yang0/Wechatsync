@@ -162,6 +162,33 @@ function findLocalImages(content: string, basePath: string): LocalImage[] {
 }
 
 /**
+ * 从 Markdown / HTML 正文开头剥离封面图（针对 X 等拥有独立顶部 Hero 封面的平台）
+ */
+function stripLeadingCover(content: string): { content: string; coverSrc: string | null; alt: string } {
+  if (!content) return { content: '', coverSrc: null, alt: '' }
+
+  const regex = /^([ \t\r\n]*(?:<!--[\s\S]*?-->[ \t\r\n]*)*(?:#+[ \t]+[^\n]+\n+[ \t\r\n]*)?)(?:!\[(?<alt>[^\]]*)\]\((?<src>[^)\s]+)(?:\s+["'][^"']*["'])?\)|\[!\[(?<alt2>[^\]]*)\]\((?<src2>[^)\s]+)(?:\s+["'][^"']*["'])?\)\]\([^)]+\)|<(?:p|figure)[^>]*>\s*<img\s+[^>]*?src=["'](?<src3>[^"']+)["'][^>]*\s*\/?>\s*<\/(?:p|figure)>|<img\s+[^>]*?src=["'](?<src4>[^"']+)["'][^>]*\s*\/?>)[ \t]*\n*/i
+
+  const match = content.match(regex)
+  if (!match) {
+    return { content, coverSrc: null, alt: '' }
+  }
+
+  const prefix = match[1] || ''
+  const src = match.groups?.src || match.groups?.src2 || match.groups?.src3 || match.groups?.src4 || null
+  const alt = match.groups?.alt || match.groups?.alt2 || ''
+
+  const rest = content.slice(match[0].length)
+  const result = (prefix + rest).replace(/^\s*\n/, '')
+
+  return {
+    content: result,
+    coverSrc: src,
+    alt,
+  }
+}
+
+/**
  * 读取本地图片为 base64
  */
 function readImageAsBase64(imagePath: string): { data: string; mimeType: string } | null {
@@ -685,6 +712,7 @@ program
   .option('--table-as-image', '将 Markdown 表格自动渲染为高清卡片图片（默认对 X 平台启用）')
   .option('--no-table-as-image', '禁用表格自动转图片')
   .option('--save-table-images', '将渲染出的表格图片和替换后的引用写回 Markdown 源文件')
+  .option('--keep-cover-in-body', '在正文保留首部封面图（默认对 X 平台自动剥离首部重复封面）')
   .option('--dry-run', '仅显示将要执行的操作，不实际同步')
   .action(async (file: string, options) => {
     // 检查文件是否存在
@@ -793,37 +821,60 @@ program
     let processedHtml = html
     const platformContents: Record<string, { html: string; markdown: string }> = {}
 
-    if (localImages.length > 0) {
-      // 1. 如果目标包含 X (Twitter)：X 必须使用自身的 Twitter media_id，不能使用外部 URL
-      if (platforms.includes('x')) {
-        console.log(chalk.bold(`发现 ${localImages.length} 张本地图片，上传到 X (Twitter)...`))
-        const xResult = await processLocalImages(parsed.content, fileDir, bridge, 'x')
-        console.log(
-          `X 图片上传完成: ${chalk.green(xResult.uploadedCount + ' 成功')}, ${chalk.red(xResult.failedCount + ' 失败')}`
-        )
-        console.log()
-
-        if (platforms.length === 1) {
-          if (xResult.uploadedCount > 0) {
-            processedMarkdown = xResult.content
-            processedHtml = parsed.format === 'markdown' ? markdownToHtml(xResult.content) : xResult.content
-          }
-        } else {
-          if (xResult.uploadedCount > 0) {
-            platformContents['x'] = {
-              markdown: xResult.content,
-              html: '',
+    // 1. 如果目标包含 X (Twitter)：X 拥有独立的顶部 Hero 封面，需从正文中剥离首部置顶封面，且必须使用 Twitter 自身的 media_id
+    if (platforms.includes('x')) {
+      let xRawContent = parsed.content
+      if (!options.keepCoverInBody) {
+        const stripped = stripLeadingCover(xRawContent)
+        if (stripped.coverSrc) {
+          xRawContent = stripped.content
+          console.log(chalk.gray(`  (已为 X 平台移除正文首部的重复封面图)`))
+          // 如果此前未通过参数指定封面，自动将首图提升为封面
+          if (!cover && stripped.coverSrc) {
+            const resolvedCover = path.isAbsolute(stripped.coverSrc)
+              ? stripped.coverSrc
+              : path.resolve(fileDir, stripped.coverSrc)
+            if (fs.existsSync(resolvedCover)) {
+              const coverBuf = fs.readFileSync(resolvedCover)
+              const ext = path.extname(resolvedCover).toLowerCase()
+              const mime = MIME_TYPES[ext] || 'image/png'
+              cover = `data:${mime};base64,${coverBuf.toString('base64')}`
             }
           }
         }
       }
 
-      // 2. 对于除 X 以外的其他目标平台，挑选合适的目标平台作为公共图床
-      const nonXPlatforms = platforms.filter((p: string) => p !== 'x')
-      if (nonXPlatforms.length > 0) {
+      const xLocalImages = findLocalImages(xRawContent, fileDir)
+      let xFinalMarkdown = xRawContent
+      if (xLocalImages.length > 0) {
+        console.log(chalk.bold(`发现 ${xLocalImages.length} 张本地图片，上传到 X (Twitter)...`))
+        const xResult = await processLocalImages(xRawContent, fileDir, bridge, 'x')
+        console.log(
+          `X 图片上传完成: ${chalk.green(xResult.uploadedCount + ' 成功')}, ${chalk.red(xResult.failedCount + ' 失败')}`
+        )
+        console.log()
+        xFinalMarkdown = xResult.content
+      }
+
+      if (platforms.length === 1) {
+        processedMarkdown = xFinalMarkdown
+        processedHtml = parsed.format === 'markdown' ? markdownToHtml(xFinalMarkdown) : xFinalMarkdown
+      } else {
+        platformContents['x'] = {
+          markdown: xFinalMarkdown,
+          html: '',
+        }
+      }
+    }
+
+    // 2. 对于除 X 以外的其他目标平台，挑选合适的目标平台作为公共图床
+    const nonXPlatforms = platforms.filter((p: string) => p !== 'x')
+    if (nonXPlatforms.length > 0) {
+      const nonXLocalImages = findLocalImages(parsed.content, fileDir)
+      if (nonXLocalImages.length > 0) {
         const preferredHosts = ['weixin', 'zhihu', 'weibo', 'juejin', 'csdn']
         const imageHost = preferredHosts.find((p) => nonXPlatforms.includes(p)) || nonXPlatforms[0]
-        console.log(chalk.bold(`发现 ${localImages.length} 张本地图片，上传到 ${imageHost}...`))
+        console.log(chalk.bold(`发现 ${nonXLocalImages.length} 张本地图片，上传到 ${imageHost}...`))
         console.log()
 
         const imageResult = await processLocalImages(parsed.content, fileDir, bridge, imageHost)
