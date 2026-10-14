@@ -285,7 +285,10 @@ export async function performSync(
   // 同源平台跳过预处理（如微信到微信）
   const sourcePlatform = (article as any).source?.platform
   const platformsToPreprocess = dslPlatformIds.filter((id: string) => id !== sourcePlatform)
-  let processedArticle: typeof normalizedArticle & { platformContents?: Record<string, { html: string; markdown: string }> } = normalizedArticle
+  let processedArticle: typeof normalizedArticle & { platformContents?: Record<string, { html: string; markdown: string }> } = {
+    ...normalizedArticle,
+    platformContents: (article as any).platformContents,
+  }
   if (platformsToPreprocess.length > 0) {
     const configs = getPlatformPreprocessConfigs(platformsToPreprocess)
     // CLI/MCP 来源的 HTML 保留 <style> 标签（用户自定义排版）
@@ -298,8 +301,14 @@ export async function performSync(
     if (rawHtml) {
       const preprocessResult = await sendPreprocessMessage(rawHtml, platformsToPreprocess, configs)
       if (preprocessResult) {
-        processedArticle = { ...normalizedArticle, platformContents: preprocessResult }
-        logger.debug('Preprocessed for platforms:', Object.keys(preprocessResult))
+        processedArticle = {
+          ...normalizedArticle,
+          platformContents: {
+            ...preprocessResult,
+            ...((article as any).platformContents || {}),
+          },
+        }
+        logger.debug('Preprocessed for platforms:', Object.keys(processedArticle.platformContents || {}))
       } else {
         logger.warn('DOM preprocessing unavailable — please ensure at least one web page is open in Chrome')
       }

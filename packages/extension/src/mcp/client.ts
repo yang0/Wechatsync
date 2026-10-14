@@ -322,6 +322,13 @@ class McpClient {
         return await checkPlatformAuth(platform)
       }
 
+      case 'reloadExtension': {
+        setTimeout(() => {
+          chrome.runtime.reload()
+        }, 100)
+        return { success: true }
+      }
+
       case 'syncArticle': {
         const platforms = params?.platforms as string[]
         const articleData = params?.article as {
@@ -357,6 +364,7 @@ class McpClient {
           html: htmlContent,
           markdown: markdown,
           cover: articleData.cover,
+          platformContents: (articleData as any).platformContents,
         }
 
         // 使用 sync-service 进行同步（支持 DSL 平台 + CMS 账户、历史记录、状态保存）

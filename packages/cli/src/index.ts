@@ -791,34 +791,61 @@ program
 
     let processedMarkdown = markdown
     let processedHtml = html
+    const platformContents: Record<string, { html: string; markdown: string }> = {}
 
     if (localImages.length > 0) {
-      // 优先从目标平台中挑选适合做图床的平台
-      const preferredHosts = ['weixin', 'zhihu', 'weibo', 'juejin', 'csdn']
-      const imageHost = preferredHosts.find((p) => platforms.includes(p)) || platforms[0]
-      console.log(chalk.bold(`发现 ${localImages.length} 张本地图片，上传到 ${imageHost}...`))
-      console.log()
+      // 1. 如果目标包含 X (Twitter)：X 必须使用自身的 Twitter media_id，不能使用外部 URL
+      if (platforms.includes('x')) {
+        console.log(chalk.bold(`发现 ${localImages.length} 张本地图片，上传到 X (Twitter)...`))
+        const xResult = await processLocalImages(parsed.content, fileDir, bridge, 'x')
+        console.log(
+          `X 图片上传完成: ${chalk.green(xResult.uploadedCount + ' 成功')}, ${chalk.red(xResult.failedCount + ' 失败')}`
+        )
+        console.log()
 
-      const imageResult = await processLocalImages(parsed.content, fileDir, bridge, imageHost)
-
-      if (imageResult.uploadedCount > 0) {
-        // 更新内容
-        if (parsed.format === 'markdown') {
-          processedMarkdown = imageResult.content
-          processedHtml = markdownToHtml(imageResult.content)
+        if (platforms.length === 1) {
+          if (xResult.uploadedCount > 0) {
+            processedMarkdown = xResult.content
+            processedHtml = parsed.format === 'markdown' ? markdownToHtml(xResult.content) : xResult.content
+          }
         } else {
-          processedHtml = imageResult.content
+          if (xResult.uploadedCount > 0) {
+            platformContents['x'] = {
+              markdown: xResult.content,
+              html: '',
+            }
+          }
         }
       }
 
-      console.log()
-      console.log(
-        `图片上传完成: ${chalk.green(imageResult.uploadedCount + ' 成功')}, ${chalk.red(imageResult.failedCount + ' 失败')}`
-      )
-      if (platforms.length > 1) {
-        console.log(chalk.gray(`(其他平台将从 ${imageHost} 图床转存)`))
+      // 2. 对于除 X 以外的其他目标平台，挑选合适的目标平台作为公共图床
+      const nonXPlatforms = platforms.filter((p: string) => p !== 'x')
+      if (nonXPlatforms.length > 0) {
+        const preferredHosts = ['weixin', 'zhihu', 'weibo', 'juejin', 'csdn']
+        const imageHost = preferredHosts.find((p) => nonXPlatforms.includes(p)) || nonXPlatforms[0]
+        console.log(chalk.bold(`发现 ${localImages.length} 张本地图片，上传到 ${imageHost}...`))
+        console.log()
+
+        const imageResult = await processLocalImages(parsed.content, fileDir, bridge, imageHost)
+
+        if (imageResult.uploadedCount > 0) {
+          if (parsed.format === 'markdown') {
+            processedMarkdown = imageResult.content
+            processedHtml = markdownToHtml(imageResult.content)
+          } else {
+            processedHtml = imageResult.content
+          }
+        }
+
+        console.log()
+        console.log(
+          `图片上传完成: ${chalk.green(imageResult.uploadedCount + ' 成功')}, ${chalk.red(imageResult.failedCount + ' 失败')}`
+        )
+        if (nonXPlatforms.length > 1) {
+          console.log(chalk.gray(`(其他平台将从 ${imageHost} 图床转存)`))
+        }
+        console.log()
       }
-      console.log()
     }
 
     const syncSpinner = ora('正在同步...').start()
@@ -831,6 +858,7 @@ program
           markdown: processedMarkdown,
           content: processedHtml,
           cover,
+          platformContents: Object.keys(platformContents).length > 0 ? platformContents : undefined,
         },
       })
 
