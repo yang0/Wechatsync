@@ -224,6 +224,12 @@ class McpClient {
     logger.debug(`Reconnecting in ${interval / 1000}s (${isWarm ? 'warm' : 'cold'})...`)
 
     this.reconnectAttempts++
+    try {
+      const alarmDelay = Math.max(0.1, (interval / 1000) / 60)
+      chrome.alarms?.create('mcp_reconnect', { delayInMinutes: alarmDelay })
+    } catch {
+      // 忽略非扩展环境异常
+    }
     this.reconnectTimer = setTimeout(() => {
       this.reconnectTimer = null
       this.connect()

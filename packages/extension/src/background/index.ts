@@ -1215,12 +1215,32 @@ preCheckPlatformsAuth()
 chrome.alarms.create('daily_growth_metrics', { periodInMinutes: 24 * 60 })
 // 设置远程配置定期拉取（每 6 小时）
 chrome.alarms.create('remote_config_fetch', { periodInMinutes: 6 * 60 })
+// 设置 MCP 唤醒保活定时器（每 1 分钟检测一次，避免 MV3 Service Worker 休眠断连）
+chrome.alarms.create('mcp_keepalive', { periodInMinutes: 1 })
+
 chrome.alarms.onAlarm.addListener((alarm) => {
   if (alarm.name === 'daily_growth_metrics') {
     trackGrowthMetrics().catch(() => {})
   }
   if (alarm.name === 'remote_config_fetch') {
     fetchRemoteConfig().catch(() => {})
+  }
+  if (alarm.name === 'mcp_keepalive' || alarm.name === 'mcp_reconnect') {
+    if (!mcpClient.isConnected()) {
+      initMcpIfEnabled().catch(() => {})
+    }
+  }
+})
+
+// 用户在 Chrome 中切换标签页或聚焦窗口时，自动检测并唤醒 MCP 连接
+chrome.tabs.onActivated.addListener(() => {
+  if (!mcpClient.isConnected()) {
+    initMcpIfEnabled().catch(() => {})
+  }
+})
+chrome.windows.onFocusChanged.addListener((windowId) => {
+  if (windowId !== chrome.windows.WINDOW_ID_NONE && !mcpClient.isConnected()) {
+    initMcpIfEnabled().catch(() => {})
   }
 })
 
